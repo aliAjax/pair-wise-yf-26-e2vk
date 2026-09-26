@@ -1,7 +1,127 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>数字档案长期保存</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}input,textarea,button,select{font:inherit;padding:8px;margin:4px}textarea{width:100%;height:110px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin:12px 0}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}</style></head>
-<body><h1>数字档案长期保存</h1><p>演示账号：owner、archivist、auditor、outsider。请求使用 <code>X-User-Id</code>。</p>
-<section class="panel"><select id="user"><option>owner</option><option>archivist</option><option>auditor</option><option>outsider</option></select>
-<button onclick="loadStatus()">查看档案状态</button><pre id="out"></pre></section>
-<p>详细接口见 README。页面用于完成初始化后的状态检查，核心流程由 JSON API 提供。</p>
-<script>const out=document.querySelector("#out"),user=document.querySelector("#user");async function loadStatus(){const id=prompt("档案 ID","1");const r=await fetch(`/api/archives/${id}/status`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>数字档案长期保存 · 解密公开</title>
+<style>
+body{font:16px system-ui;max-width:1020px;margin:32px auto;padding:0 16px;color:#222}
+input,textarea,button,select{font:inherit;padding:8px;margin:4px 0}
+input[type=number],input[type=text]{width:120px}
+textarea{width:100%;box-sizing:border-box;height:60px}
+.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin:12px 0}
+.panel h2{margin:0 0 8px;font-size:18px}
+pre{background:#f4f4f4;padding:12px;white-space:pre-wrap;border-radius:6px;min-height:24px}
+button{cursor:pointer;border-radius:6px;border:1px solid #888;background:#fff}
+button.primary{background:#1a5fb4;color:#fff;border-color:#1a5fb4}
+button.ok{background:#2a7d2e;color:#fff;border-color:#2a7d2e}
+button.no{background:#c01c28;color:#fff;border-color:#c01c28}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+table{border-collapse:collapse;width:100%;margin-top:8px}
+td,th{border:1px solid #ddd;padding:6px 8px;text-align:left;font-size:14px}
+.muted{color:#666;font-size:13px}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;color:#fff}
+.pending{background:#b8860b}.approved{background:#2a7d2e}.rejected{background:#c01c28}
+</style></head>
+<body>
+<h1>数字档案长期保存 · 到期解密公开</h1>
+<div class="row">
+  <label>当前用户（X-User-Id）：
+    <select id="user"><option>owner</option><option>archivist</option><option>auditor</option><option>outsider</option></select>
+  </label>
+  <span class="muted">公开目录无需登录；复核限 owner / archivist，且不能复核自己提出的申请。</span>
+</div>
+
+<section class="panel">
+  <h2>① 公开目录与清单（公众可查）</h2>
+  <div class="row"><button class="primary" onclick="loadCatalog()">刷新公开目录</button></div>
+  <table><thead><tr><th>ID</th><th>档案名称</th><th>保密截止</th><th>操作</th></tr></thead>
+  <tbody id="catalog"><tr><td colspan="4" class="muted">点击“刷新公开目录”查看已解密档案。</td></tr></tbody></table>
+  <pre id="manifest"></pre>
+</section>
+
+<section class="panel">
+  <h2>② 提交解密申请（到期 + 无待处理申请 + 旧格式已迁移）</h2>
+  <div class="row">
+    档案 ID <input type="number" id="submitId" value="2">
+    说明 <input type="text" id="submitReason" style="width:320px" placeholder="如：保密期限已过，申请公开目录">
+    <button class="primary" onclick="submitRequest()">提交申请</button>
+  </div>
+  <pre id="submitOut"></pre>
+  <p class="muted">若仍有文件未迁移到新格式，这里会列出具体文件；迁移完成后再提交。每个档案只保留一份待处理申请。</p>
+</section>
+
+<section class="panel">
+  <h2>③ 复核队列（另一名同事处理）</h2>
+  <div class="row"><button class="primary" onclick="loadPending()">刷新待处理申请</button></div>
+  <table><thead><tr><th>申请 ID</th><th>档案</th><th>提出人</th><th>第几次</th><th>说明</th><th>复核</th></tr></thead>
+  <tbody id="pending"><tr><td colspan="6" class="muted">点击“刷新待处理申请”。</td></tr></tbody></table>
+  <pre id="reviewOut"></pre>
+</section>
+
+<section class="panel">
+  <h2>④ 查看某档案的申请记录（含驳回意见与提交次数）</h2>
+  <div class="row">档案 ID <input type="number" id="histId" value="2"><button onclick="loadHistory()">查看记录</button></div>
+  <pre id="history"></pre>
+</section>
+
+<script>
+const $ = id => document.getElementById(id);
+const headers = () => ({'X-User-Id': $('user').value, 'Content-Type': 'application/json'});
+async function api(url, opts){
+  const r = await fetch(url, opts);
+  return {status:r.status, body: await r.json().catch(()=>({}))};
+}
+function show(el, x){ $(el).textContent = JSON.stringify(x, null, 2); }
+function esc(s){ return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+async function loadCatalog(){
+  const {body} = await api('/api/public/catalog');
+  const rows = (body.public||[]).map(a =>
+    `<tr><td>${a.id}</td><td>${esc(a.name)}</td><td>${a.retention_until}</td>
+     <td><button onclick="loadManifest(${a.id})">查看公开清单</button></td></tr>`).join('');
+  $('catalog').innerHTML = rows || '<tr><td colspan="4" class="muted">暂无已解密档案。</td></tr>';
+  $('manifest').textContent = '';
+}
+async function loadManifest(id){
+  const {body} = await api(`/api/public/archives/${id}/manifest`);
+  show('manifest', body);
+}
+
+async function submitRequest(){
+  const payload = {reason: $('submitReason').value};
+  const {body} = await api(`/api/archives/${$('submitId').value}/declassification`,
+    {method:'POST', headers:headers(), body: JSON.stringify(payload)});
+  show('submitOut', body);
+}
+
+async function loadPending(){
+  const {body} = await api('/api/declassification/requests', {headers:{'X-User-Id':$('user').value}});
+  const rows = (body.pending||[]).map(r =>
+    `<tr><td>${r.id}</td><td>${r.archive_id} · ${esc(r.archive_name)}</td><td>${esc(r.requested_by)}</td>
+     <td>第 ${r.attempt} 次</td><td class="muted">${esc(r.reason)}</td>
+     <td><button class="ok" onclick="review(${r.id},true)">批准</button>
+         <button class="no" onclick="review(${r.id},false)">驳回</button></td></tr>`).join('');
+  $('pending').innerHTML = rows || '<tr><td colspan="6" class="muted">当前没有待处理申请。</td></tr>';
+}
+async function review(id, approve){
+  let comment = '';
+  if(!approve){
+    comment = prompt('驳回必须写明意见：') ;
+    if(!comment || !comment.trim()){ $('reviewOut').textContent = '已取消：驳回必须写明意见。'; return; }
+  } else {
+    comment = prompt('批准意见（可留空）：', '同意公开') || '';
+  }
+  const {body} = await api(`/api/declassification/${id}`,
+    {method:'POST', headers:headers(), body: JSON.stringify({approve, comment})});
+  show('reviewOut', body);
+  loadPending();
+  loadCatalog();
+}
+
+async function loadHistory(){
+  const {body} = await api(`/api/archives/${$('histId').value}/declassification`,
+    {headers:{'X-User-Id':$('user').value}});
+  if(body.error){ show('history', body); return; }
+  const lines = (body.requests||[]).map(r =>
+    `#${r.id} 第${r.attempt}次 ${r.state}  提出人:${r.requested_by}  时间:${r.created_at}` +
+    (r.review_comment ? `\n   复核人:${r.reviewer_id} 意见:${r.review_comment}` : '')).join('\n');
+  $('history').textContent = lines || '该档案暂无解密申请。';
+}
+</script>
+</body></html>

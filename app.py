@@ -8,20 +8,22 @@ import hashlib
 import json
 import sqlite3
 import threading
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = BASE_DIR / "preservation.db"
 MAX_FILE_SIZE = 10 * 1024 * 1024
+# 这些扩展名属于旧格式：最新版本中仍存在这些文件时，解密申请暂不受理。
+LEGACY_EXTENSIONS = {".xml", ".tif", ".tiff", ".gif", ".bmp", ".doc", ".rtf"}
 
 
 class BusinessError(Exception):
-    def __init__(self, message: str, status: int = 400, code: str = "bad_request"):
+    def __init__(self, message: str, status: int = 400, code: str = "bad_request", details: dict | None = None):
         super().__init__(message)
-        self.message, self.status, self.code = message, status, code
+        self.message, self.status, self.code, self.details = message, status, code, details
 
 
 def now() -> str:
@@ -144,6 +146,21 @@ class PreservationStore:
                     detail TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS declassification_requests(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    archive_id INTEGER NOT NULL REFERENCES archives(id),
+                    requested_by TEXT NOT NULL REFERENCES users(id),
+                    reason TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL CHECK(state IN ('pending','approved','rejected')),
+                    attempt INTEGER NOT NULL DEFAULT 1,
+                    reviewer_id TEXT REFERENCES users(id),
+                    review_comment TEXT,
+                    reviewed_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_declass_archive ON declassification_requests(archive_id,id);
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_declass_pending_archive
+                    ON declassification_requests(archive_id) WHERE state='pending';
                 """
             )
 
@@ -159,6 +176,82 @@ class PreservationStore:
                     ("outsider", "未授权访客", "auditor"),
                 ],
             )
+        self._seed_demo()
+
+    def _seed_demo(self) -> None:
+        """写入演示用解密场景数据，已存在同名档案时跳过。"""
+        today = date.today()
+        with self.connect() as conn:
+            if conn.execute("SELECT COUNT(*) FROM archives").fetchone()[0]:
+                return
+            past = (today - timedelta(days=30)).isoformat()
+            future = (today + timedelta(days=3650)).isoformat()
+
+            def add_archive(name: str, retention: str, restricted: int) -> int:
+                cur = conn.execute(
+                    "INSERT INTO archives(name,owner_id,retention_until,restricted,created_at) VALUES(?,?,?,?,?)",
+                    (name, "owner", retention, restricted, now()),
+                )
+                aid = cur.lastrowid
+                conn.execute(
+                    "INSERT INTO archive_members(archive_id,user_id,permission) VALUES(?,'owner','write')", (aid,)
+                )
+                return aid
+
+            def add_version(aid: int, version_no: int, actor: str, files: list[tuple[str, bytes]]) -> int:
+                cur = conn.execute(
+                    "INSERT INTO archive_versions(archive_id,version,created_by,created_at) VALUES(?,?,?,?)",
+                    (aid, version_no, actor, now()),
+                )
+                vid = cur.lastrowid
+                for path, content in files:
+                    conn.execute(
+                        "INSERT INTO archive_files(version_id,path,sha256,size,content) VALUES(?,?,?,?,?)",
+                        (vid, path, hashlib.sha256(content).hexdigest(), len(content), content),
+                    )
+                return vid
+
+            def grant_archivist(aid: int) -> None:
+                conn.execute(
+                    "INSERT INTO archive_members(archive_id,user_id,permission) VALUES(?,'archivist','write')", (aid,)
+                )
+
+            # A：已解密公开的到期档案。
+            a = add_archive("已公开历史测绘档案", past, 0)
+            v1 = add_version(a, 1, "owner", [("maps/overview.html", b"<html><body>overview</body></html>"),
+                                              ("README.txt", b"public archive readme")])
+            self._audit(conn, a, "owner", "declassify.approve",
+                        {"request_id": 0, "reviewer_id": "archivist", "restricted": 0})
+
+            # B：已到期但最新版本仍含旧格式 .tif/.xml，迁移前申请不受理。
+            grant_archivist(a)
+            b = add_archive("到期待解密-含旧格式", past, 1)
+            add_version(b, 1, "archivist", [("scan/page.tif", b"\x49\x49\x2a\x00legacy-tif"),
+                                             ("records/meta.xml", b"<meta/>"),
+                                             ("notes.txt", b"needs migration")])
+
+            # C：已到期且全部为新格式，且已有一份由 archivist 提交的待处理申请（等 owner 复核）。
+            grant_archivist(b)
+            c = add_archive("到期待解密-可受理", past, 1)
+            cv1 = add_version(c, 1, "archivist", [("scan/page.tif", b"\x49\x49\x2a\x00old"),
+                                                   ("index/data.xml", b"<index>data</index>")])
+            cv2 = add_version(c, 2, "archivist", [("scan/page.png", b"\x89PNG new-format"),
+                                                   ("index/data.json", b'{"index":"data"}')])
+            conn.execute(
+                "INSERT INTO migrations(source_version_id,target_version_id,source_path,target_path,target_format,actor_id,created_at)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (cv1, cv2, "scan/page.tif", "scan/page.png", "png", "archivist", now()),
+            )
+            conn.execute(
+                "INSERT INTO declassification_requests(archive_id,requested_by,reason,state,attempt,created_at)"
+                " VALUES(?,?,?,?,1,?)",
+                (c, "archivist", "保密期限已过，公众目录应可检索", "pending", now()),
+            )
+
+            # D：尚未到期，不能进队列。
+            grant_archivist(c)
+            d = add_archive("未到期受限档案", future, 1)
+            grant_archivist(d)
 
     def _user(self, conn, user_id: str | None, roles: set[str] | None = None) -> sqlite3.Row:
         if not user_id:
@@ -446,6 +539,173 @@ class PreservationStore:
                 "audit": [dict(r) | {"detail": json.loads(r["detail"])} for r in conn.execute("SELECT * FROM audit_log WHERE archive_id=? ORDER BY id", (archive_id,)).fetchall()],
             }
 
+    def _latest_version(self, conn, archive_id: int) -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT * FROM archive_versions WHERE archive_id=? ORDER BY version DESC LIMIT 1", (archive_id,)
+        ).fetchone()
+
+    def _unmigrated_files(self, conn, archive_id: int) -> list[dict]:
+        """最新版本中扩展名称属于旧格式、仍未迁移到新格式的文件。"""
+        latest = self._latest_version(conn, archive_id)
+        if not latest:
+            return []
+        rows = conn.execute("SELECT path,sha256,size FROM archive_files WHERE version_id=? ORDER BY path",
+                            (latest["id"],)).fetchall()
+        return [dict(r) for r in rows if PurePosixPath(r["path"]).suffix.lower() in LEGACY_EXTENSIONS]
+
+    def _request_row(self, conn, request_id: int) -> sqlite3.Row:
+        req = conn.execute("SELECT * FROM declassification_requests WHERE id=?", (request_id,)).fetchone()
+        if not req:
+            raise BusinessError("解密申请不存在", 404, "not_found")
+        return req
+
+    def submit_declassification(self, user_id: str, archive_id: int, reason: str) -> dict:
+        reason = (reason or "").strip()
+        with self.connect() as conn:
+            user = self._user(conn, user_id)
+            archive = conn.execute("SELECT * FROM archives WHERE id=?", (archive_id,)).fetchone()
+            if not archive:
+                raise BusinessError("档案不存在", 404, "not_found")
+            # 解密申请是 owner/archivist 的职责行为，无需事先被加为成员；其他身份须有访问权。
+            if user["role"] not in {"owner", "archivist"}:
+                self._access(conn, archive_id, user)
+            if archive["restricted"] == 0:
+                raise BusinessError("该档案已解密，无需再次申请", 409, "already_public")
+            deadline = date.fromisoformat(archive["retention_until"])
+            if deadline >= date.today():
+                raise BusinessError(
+                    f"保密期限未到（{archive['retention_until']}），到期档案才能提交解密", 409, "retention_active"
+                )
+            pending = conn.execute(
+                "SELECT id FROM declassification_requests WHERE archive_id=? AND state='pending'", (archive_id,)
+            ).fetchone()
+            if pending:
+                raise BusinessError(
+                    "该档案已有一份待处理的解密申请，一个档案只能保留一份待处理申请", 409, "pending_exists"
+                )
+            unmigrated = self._unmigrated_files(conn, archive_id)
+            if unmigrated:
+                raise BusinessError(
+                    "档案中仍有文件未迁移到新格式，迁移完成后再提交",
+                    422, "unmigrated_files", {"files": unmigrated},
+                )
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                prior = conn.execute(
+                    "SELECT COALESCE(MAX(attempt),0) FROM declassification_requests WHERE archive_id=?", (archive_id,)
+                ).fetchone()[0]
+                attempt = prior + 1
+                cur = conn.execute(
+                    "INSERT INTO declassification_requests(archive_id,requested_by,reason,state,attempt,created_at)"
+                    " VALUES(?,?,?,'pending',?,?)",
+                    (archive_id, user_id, reason, attempt, now()),
+                )
+                request_id = cur.lastrowid
+                self._audit(conn, archive_id, user_id, "declassify.submit",
+                            {"request_id": request_id, "attempt": attempt, "reason": reason})
+                return {"id": request_id, "archive_id": archive_id, "requested_by": user_id,
+                        "state": "pending", "attempt": attempt}
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                raise BusinessError(
+                    "该档案已有一份待处理的解密申请，一个档案只能保留一份待处理申请", 409, "pending_exists"
+                )
+            except Exception:
+                conn.rollback()
+                raise
+
+    def review_declassification(self, reviewer_id: str, request_id: int, approve: bool, comment: str) -> dict:
+        comment = (comment or "").strip()
+        if not approve and not comment:
+            raise BusinessError("驳回必须写明意见", 422, "comment_required")
+        with self.connect() as conn:
+            reviewer = self._user(conn, reviewer_id, {"owner", "archivist"})
+            req = self._request_row(conn, request_id)
+            if req["requested_by"] == reviewer["id"]:
+                raise BusinessError("提出人不能复核自己的申请，请由另一名同事处理", 403, "self_review_forbidden")
+            archive = conn.execute("SELECT * FROM archives WHERE id=?", (req["archive_id"],)).fetchone()
+            self._access(conn, archive["id"], reviewer)
+            if req["state"] != "pending":
+                raise BusinessError(f"该申请已{('批准' if req['state']=='approved' else '驳回')}", 409, "request_closed")
+            new_state = "approved" if approve else "rejected"
+            conn.execute(
+                "UPDATE declassification_requests SET state=?,reviewer_id=?,review_comment=?,reviewed_at=? WHERE id=?",
+                (new_state, reviewer_id, comment, now(), request_id),
+            )
+            detail = {"request_id": request_id, "comment": comment, "attempt": req["attempt"]}
+            if approve:
+                conn.execute("UPDATE archives SET restricted=0 WHERE id=?", (archive["id"],))
+                detail["restricted"] = 0
+            self._audit(conn, archive["id"], reviewer_id,
+                        "declassify.approve" if approve else "declassify.reject", detail)
+            return {"id": request_id, "archive_id": archive["id"], "state": new_state,
+                    "reviewer_id": reviewer_id, "review_comment": comment}
+
+    def list_pending_requests(self, user_id: str) -> dict:
+        with self.connect() as conn:
+            self._user(conn, user_id, {"owner", "archivist"})
+            rows = conn.execute(
+                """SELECT r.id,r.archive_id,a.name AS archive_name,r.requested_by,r.reason,r.attempt,r.created_at
+                   FROM declassification_requests r JOIN archives a ON a.id=r.archive_id
+                   WHERE r.state='pending' ORDER BY r.id"""
+            ).fetchall()
+            return {"pending": [dict(r) for r in rows]}
+
+    def list_archive_requests(self, user_id: str, archive_id: int) -> dict:
+        with self.connect() as conn:
+            user = self._user(conn, user_id)
+            self._access(conn, archive_id, user)
+            rows = conn.execute(
+                """SELECT id,archive_id,requested_by,reason,state,attempt,reviewer_id,review_comment,reviewed_at,created_at
+                   FROM declassification_requests WHERE archive_id=? ORDER BY id""",
+                (archive_id,),
+            ).fetchall()
+            return {"archive_id": archive_id, "requests": [dict(r) for r in rows]}
+
+    def public_catalog(self) -> dict:
+        """公开目录：任何访客（无需登录）都能查到已解密档案的名称与期限。"""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id,name,retention_until FROM archives WHERE restricted=0 ORDER BY id"
+            ).fetchall()
+            return {"public": [dict(r) for r in rows]}
+
+    def public_manifest(self, archive_id: int) -> dict:
+        """公开清单：已解密档案的最新版本文件列表（哈希、大小），不含正文内容。"""
+        with self.connect() as conn:
+            archive = conn.execute("SELECT id,name,retention_until,restricted FROM archives WHERE id=?", (archive_id,)).fetchone()
+            if not archive:
+                raise BusinessError("档案不存在", 404, "not_found")
+            if archive["restricted"]:
+                raise BusinessError("该档案仍受限，公众无法查看", 403, "restricted")
+            latest = self._latest_version(conn, archive_id)
+            if not latest:
+                files, version_info = [], None
+            else:
+                files = [dict(r) for r in conn.execute(
+                    "SELECT path,sha256,size FROM archive_files WHERE version_id=? ORDER BY path", (latest["id"],)
+                ).fetchall()]
+                version_info = {"version": latest["version"], "state": latest["state"]}
+            return {"archive": dict(archive), "version": version_info, "files": files}
+
+    def get_file_content(self, user_id: str, archive_id: int, path: str) -> dict:
+        """正文读取：即使档案已解密，正文仍要求成员权限。"""
+        with self.connect() as conn:
+            user = self._user(conn, user_id)
+            self._access(conn, archive_id, user)
+            latest = self._latest_version(conn, archive_id)
+            if not latest:
+                raise BusinessError("档案尚无文件版本", 404, "no_version")
+            row = conn.execute(
+                "SELECT path,sha256,size,content FROM archive_files WHERE version_id=? AND path=?",
+                (latest["id"], path),
+            ).fetchone()
+            if not row:
+                raise BusinessError("文件不存在", 404, "not_found")
+            return {"archive_id": archive_id, "version": latest["version"], "path": row["path"],
+                    "sha256": row["sha256"], "size": row["size"],
+                    "content_b64": base64.b64encode(row["content"]).decode()}
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "Preservation/1.0"
@@ -499,6 +759,26 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(201, store.grant(user, archive_id, d.get("user_id", ""), d.get("permission", "")))
         if len(parts) == 4 and parts[:2] == ["api", "archives"] and parts[3] == "status" and method == "GET":
             return self._send(200, store.archive_status(user, int(parts[2])))
+        if parts == ["api", "public", "catalog"] and method == "GET":
+            return self._send(200, store.public_catalog())
+        if len(parts) == 5 and parts[:3] == ["api", "public", "archives"] and parts[4] == "manifest" and method == "GET":
+            return self._send(200, store.public_manifest(int(parts[3])))
+        if len(parts) == 4 and parts[:2] == ["api", "archives"] and parts[3] == "declassification":
+            if method == "POST":
+                d = self._body()
+                return self._send(201, store.submit_declassification(user, int(parts[2]), d.get("reason", "")))
+            if method == "GET":
+                return self._send(200, store.list_archive_requests(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "archives"] and parts[3] == "files" and method == "GET":
+            query = parse_qs(urlparse(self.path).query)
+            path = query.get("path", [""])[0]
+            return self._send(200, store.get_file_content(user, int(parts[2]), path))
+        if parts == ["api", "declassification", "requests"] and method == "GET":
+            return self._send(200, store.list_pending_requests(user))
+        if len(parts) == 3 and parts[:2] == ["api", "declassification"] and method == "POST":
+            d = self._body()
+            return self._send(200, store.review_declassification(
+                user, int(parts[2]), bool(d.get("approve")), d.get("comment", "")))
         if len(parts) == 3 and parts[:2] == ["api", "versions"] and method == "GET":
             return self._send(200, store.get_version(user, int(parts[2])))
         if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "copies" and method == "POST":
@@ -518,7 +798,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self._dispatch(method)
         except BusinessError as exc:
-            self._send(exc.status, {"error": {"code": exc.code, "message": exc.message}})
+            error = {"code": exc.code, "message": exc.message}
+            if exc.details:
+                error["details"] = exc.details
+            self._send(exc.status, {"error": error})
         except (ValueError, TypeError):
             self._send(400, {"error": {"code": "invalid_path", "message": "路径参数格式错误"}})
         except Exception as exc:
