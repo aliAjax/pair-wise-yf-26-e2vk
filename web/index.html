@@ -1,7 +1,36 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>数字档案长期保存</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}input,textarea,button,select{font:inherit;padding:8px;margin:4px}textarea{width:100%;height:110px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin:12px 0}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}</style></head>
+<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}input,textarea,button,select{font:inherit;padding:8px;margin:4px}textarea{width:100%;height:110px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin:12px 0}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.req{border-top:1px dashed #bbb;padding:8px 0}</style></head>
 <body><h1>数字档案长期保存</h1><p>演示账号：owner、archivist、auditor、outsider。请求使用 <code>X-User-Id</code>。</p>
 <section class="panel"><select id="user"><option>owner</option><option>archivist</option><option>auditor</option><option>outsider</option></select>
 <button onclick="loadStatus()">查看档案状态</button><pre id="out"></pre></section>
-<p>详细接口见 README。页面用于完成初始化后的状态检查，核心流程由 JSON API 提供。</p>
-<script>const out=document.querySelector("#out"),user=document.querySelector("#user");async function loadStatus(){const id=prompt("档案 ID","1");const r=await fetch(`/api/archives/${id}/status`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<section class="panel"><h2>提交解密申请</h2>
+<p>仅保密期限已到期的受限档案可进队列；仍有未迁到新格式的文件时不受理并列出清单；同一档案只留一份待处理申请。</p>
+<input id="declassArchive" placeholder="档案 ID" size="8"><input id="declassReason" placeholder="申请理由" size="42">
+<button onclick="submitDeclass()">提交申请</button><pre id="declassOut"></pre></section>
+<section class="panel"><h2>复核解密申请</h2>
+<p>提出人不能复核自己的申请，请换一名同事操作；驳回必须写明意见，补充后可重提（自动记录轮次）。</p>
+<button onclick="loadQueue()">刷新待处理队列</button><div id="queue"></div><pre id="reviewOut"></pre></section>
+<section class="panel"><h2>公开目录（无需登录）</h2>
+<p>解密批准后档案不再受限，公众可查目录和清单；正文仍需成员权限。</p>
+<button onclick="loadPublic()">查看公开目录</button><div id="public"></div><pre id="publicOut"></pre></section>
+<script>
+const $=s=>document.querySelector(s),user=$("#user");
+const show=(el,obj)=>{el.textContent=typeof obj==="string"?obj:JSON.stringify(obj,null,2)};
+async function api(path,opts={}){opts.headers={"X-User-Id":user.value,"Content-Type":"application/json"};const r=await fetch(path,opts);return{r,body:await r.json().catch(()=>({}))}}
+async function loadStatus(){const id=prompt("档案 ID","1");if(!id)return;const{body}=await api(`/api/archives/${id}/status`);show($("#out"),body)}
+async function submitDeclass(){const id=$("#declassArchive").value.trim();if(!id)return show($("#declassOut"),"请填写档案 ID");
+const{body}=await api(`/api/archives/${id}/declassification-requests`,{method:"POST",body:JSON.stringify({reason:$("#declassReason").value})});show($("#declassOut"),body)}
+async function loadQueue(){const{body}=await api("/api/declassification-requests?status=pending");const q=$("#queue");q.innerHTML="";
+if(body.error)return show(q,body.error.message);(body.requests||[]).forEach(r=>{const div=document.createElement("div");div.className="req";
+const label=document.createElement("span");label.textContent=`#${r.id} 档案「${r.archive_name}」(ID ${r.archive_id}) 第 ${r.round_no} 轮 · 提出人 ${r.requester_id} · 理由：${r.reason||"（无）"} `;
+const ok=document.createElement("button");ok.textContent="批准";ok.onclick=()=>review(r.id,"approve");
+const no=document.createElement("button");no.textContent="驳回";no.onclick=()=>review(r.id,"reject");
+div.append(label,ok,no);q.append(div)});if(!(body.requests||[]).length&&!body.error)q.textContent="暂无待处理申请"}
+async function review(id,decision){let comment="";if(decision==="reject"){comment=prompt("驳回意见（必填）","");if(!comment)return show($("#reviewOut"),"已取消：驳回必须写明意见")}else{comment=prompt("复核意见（可选）","")||""}
+const{body}=await api(`/api/declassification-requests/${id}/review`,{method:"POST",body:JSON.stringify({decision,comment})});show($("#reviewOut"),body);loadQueue()}
+async function loadPublic(){const r=await fetch("/api/public/archives");const body=await r.json();const p=$("#public");p.innerHTML="";
+(body.archives||[]).forEach(a=>{const div=document.createElement("div");const label=document.createElement("span");
+label.textContent=`#${a.id} 「${a.name}」 解密于 ${a.declassified_at||"-"} `;const b=document.createElement("button");b.textContent="查看清单";b.onclick=()=>loadPublicArchive(a.id);
+div.append(label,b);p.append(div)});if(!(body.archives||[]).length)p.textContent="暂无公开档案"}
+async function loadPublicArchive(id){const r=await fetch(`/api/public/archives/${id}`);show($("#publicOut"),await r.json())}
+</script></body></html>

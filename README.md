@@ -27,6 +27,11 @@ python3 -m unittest -v
 - `POST /api/copies/{id}/verify`：校验副本；发现损坏时从健康副本修复。
 - `POST /api/copies/{id}/simulate-corruption`：演示/测试介质损坏，仅 owner 或 archivist 可用。
 - `POST /api/versions/{id}/migrate`：生成格式迁移后的新版本并保留派生关系。
-- `GET /api/archives/{id}/status`：保留期限、版本状态和审计记录。
+- `GET /api/archives/{id}/status`：保留期限、版本状态、解密申请记录和审计记录。
+- `POST /api/archives/{id}/declassification-requests`：提交解密申请。仅保密期限已到期的受限档案可进队列；最新版本仍有未迁到新格式的文件（见 `LEGACY_FORMATS`）时不受理并在 `error.files` 中列出清单，迁完再提；同一档案只留一份待处理申请。
+- `GET /api/declassification-requests?status=pending`：查看复核队列（owner/archivist/auditor）。
+- `POST /api/declassification-requests/{id}/review`：复核，`decision` 为 `approve` 或 `reject`。提出人不能复核自己的申请，须另找一名同事；驳回必须附 `comment` 意见；补充后重提自动记录轮次 `round`；批准后档案不再受限。
+- `GET /api/public/archives`、`GET /api/public/archives/{id}`：公开目录与版本文件清单，无需登录；未公开档案一律 404。
+- `GET /api/versions/{id}/files/{path}`：下载文件正文，即使档案已公开仍要求成员权限。
 
 档案路径拒绝绝对路径和 `..`；同一版本副本位置唯一；没有健康副本时版本标记为 `degraded`；所有变更写入审计日志。
